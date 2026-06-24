@@ -1,0 +1,65 @@
+# Run from inside this `backend/` directory:
+#   docker compose up --build -d
+#
+# Services & ports:
+#   api            -> http://localhost:4000   (Express + Mongoose)
+#   mongo          -> mongodb://localhost:27018/medi_treat
+#                     (host port 27018 → container 27017; offset avoids a clash
+#                      with any standalone mongo you may already run on 27017)
+#   mongo-express  -> http://localhost:8081   (browse the DB in a browser)
+#
+# PERSISTENCE: the `mongo_data` named volume below is mounted at /data/db.
+# Data survives `docker compose down` and `docker compose restart`.
+# It is ONLY destroyed by `docker compose down -v` (note the -v) or by
+# `docker volume rm backend_mongo_data`. Neither happens automatically.
+#
+# CONNECT COMPASS TO: mongodb://localhost:27018/  (NOT 27017).
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: meditreat-mongo
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: meditreat-api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      MONGO_URI: mongodb://mongo:27017/medi_treat   # underscore, matches seed.js + server.js defaults
+      UPLOAD_DIR: /app/uploads
+      PUBLIC_BASE_URL: http://localhost:4000
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./uploads:/app/uploads
+
+  mongo-express:
+    image: mongo-express:1
+    container_name: meditreat-mongo-express
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongo
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH: "false"
+    ports:
+      - "8081:8081"
+
+volumes:
+  mongo_data:
