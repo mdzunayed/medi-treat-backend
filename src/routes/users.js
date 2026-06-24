@@ -1,10 +1,8 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const mongoose = require('mongoose');
 const Account = require('../models/Account');
 const Provider = require('../models/Provider');
-const { upload, UPLOAD_DIR } = require('../middleware/upload');
+const { upload, storeImage, removeImage } = require('../middleware/upload');
 
 const router = express.Router();
 
@@ -38,20 +36,23 @@ router.post('/:id/upload-avatar', upload.single('avatar'), async (req, res) => {
       });
     }
 
-    // Filename derived from the id so a re-upload overwrites the old
-    // file (no orphan growth in /uploads). We also append a cache-bust
-    // query string when constructing the URL below so the Flutter
-    // image cache fetches the fresh bytes on the very next paint.
-    const filename = `${id}_avatar.jpg`;
-    const fullPath = path.join(UPLOAD_DIR, filename);
-    fs.writeFileSync(fullPath, req.file.buffer);
+    // Public id derived from the account id so a re-upload overwrites the
+    // old image (no orphan growth). `storeImage` returns a Cloudinary
+    // https URL in prod, or a bare `<id>_avatar.jpg` filename in local
+    // dev. We append a cache-bust query string so the Flutter image cache
+    // fetches the fresh bytes on the very next paint.
+    const stored = await storeImage(req.file.buffer, `${id}_avatar`);
 
-    // Public base — falls back to localhost in dev. Override in prod
-    // with PUBLIC_BASE_URL=https://api.your-domain.com so the URL the
-    // Flutter app stores doesn't bake `localhost` into the database.
+    // Disk fallback returns a bare filename → expose it via the /uploads
+    // mount + PUBLIC_BASE_URL. Cloudinary returns a full https URL → use
+    // it verbatim. Either way the stored value never bakes `localhost`
+    // into the DB when PUBLIC_BASE_URL is set.
+    const isFullUrl = /^https?:\/\//i.test(stored);
     const baseUrl =
       process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
-    const publicUrl = `${baseUrl}/uploads/${filename}?v=${Date.now()}`;
+    const publicUrl = isFullUrl
+      ? `${stored}?v=${Date.now()}`
+      : `${baseUrl}/uploads/${stored}?v=${Date.now()}`;
 
     // Parallel update — whichever collection has the matching _id gets
     // the write. updateOne with non-matching _id is a no-op (matchedCount
@@ -65,13 +66,9 @@ router.post('/:id/upload-avatar', upload.single('avatar'), async (req, res) => {
     const matched =
       (acctRes.matchedCount || 0) + (provRes.matchedCount || 0);
     if (matched === 0) {
-      // File was saved but no DB row owns this id — clean up the
-      // orphan so we don't leak storage.
-      try {
-        fs.unlinkSync(fullPath);
-      } catch (_) {
-        /* swallow — orphan cleanup is best-effort */
-      }
+      // Image was saved but no DB row owns this id — clean up the
+      // orphan (Cloudinary or disk) so we don't leak storage.
+      await removeImage(`${id}_avatar`);
       return res.status(404).json({
         success: false,
         message: 'User not found for that id',

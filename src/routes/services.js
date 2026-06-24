@@ -2,8 +2,8 @@ const express = require('express');
 const Service = require('../models/Service');
 const {
   upload,
-  writeImageToDisk,
-  deleteImageFromDisk,
+  storeImage,
+  removeImage,
 } = require('../middleware/upload');
 
 const router = express.Router();
@@ -53,8 +53,7 @@ router.post('/', upload.single('image'), async (req, res) => {
       status: status === 'inactive' ? 'inactive' : 'active',
     });
 
-    const filename = writeImageToDisk(req.file.buffer, doc._id.toString());
-    doc.imageUrl = filename;
+    doc.imageUrl = await storeImage(req.file.buffer, doc._id.toString());
     await doc.save();
 
     res.status(201).json(decorate(doc));
@@ -88,8 +87,7 @@ router.put('/:id', upload.single('image'), async (req, res) => {
     if (status !== undefined) doc.status = status === 'inactive' ? 'inactive' : 'active';
 
     if (req.file) {
-      const filename = writeImageToDisk(req.file.buffer, doc._id.toString());
-      doc.imageUrl = filename;
+      doc.imageUrl = await storeImage(req.file.buffer, doc._id.toString());
     }
 
     await doc.save();
@@ -123,7 +121,7 @@ router.delete('/:id', async (req, res) => {
   try {
     const doc = await Service.findByIdAndDelete(req.params.id);
     if (!doc) return res.status(404).json({ message: 'Service not found' });
-    deleteImageFromDisk(doc._id.toString());
+    await removeImage(doc._id.toString());
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ message: err.message });

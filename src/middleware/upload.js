@@ -35,4 +35,34 @@ function deleteImageFromDisk(serviceId) {
   }
 }
 
-module.exports = { upload, writeImageToDisk, deleteImageFromDisk, UPLOAD_DIR };
+const cloudinary = require('./cloudinary');
+
+// Unified image writer. Returns the value to store in the document's
+// image field:
+//   • Cloudinary on  → a full https URL (survives Render restarts).
+//   • Cloudinary off → a bare filename, served via the /uploads static
+//     mount + PUBLIC_BASE_URL (existing local-dev behaviour).
+// Callers store whatever comes back as-is; the services `decorate()`
+// helper only prepends PUBLIC_BASE_URL when the value isn't already a
+// full URL, so both shapes round-trip correctly.
+async function storeImage(buffer, publicId) {
+  if (cloudinary.isEnabled()) {
+    return cloudinary.uploadBuffer(buffer, publicId);
+  }
+  return writeImageToDisk(buffer, publicId);
+}
+
+// Mirror of storeImage for removal — clears whichever backend holds it.
+async function removeImage(publicId) {
+  await cloudinary.destroy(publicId);
+  deleteImageFromDisk(publicId);
+}
+
+module.exports = {
+  upload,
+  writeImageToDisk,
+  deleteImageFromDisk,
+  storeImage,
+  removeImage,
+  UPLOAD_DIR,
+};
