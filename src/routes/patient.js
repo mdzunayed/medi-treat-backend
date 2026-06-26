@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const CareRequest = require('../models/CareRequest');
 const Account = require('../models/Account');
 const { attachDoctorToRequest } = require('../utils/doctorView');
@@ -119,6 +120,53 @@ router.post('/requests', async (req, res) => {
     }
 
     res.status(201).json(doc.toJSON());
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /patient/requests/:id/cancel  { reason? }
+//
+// Patient-initiated cancellation from the "Under Review" queue. Only allowed
+// BEFORE a field coordinator claims the dispatch — once it's `assigned` (or
+// further), the patient can no longer pull it back unilaterally. Implemented
+// as an atomic compare-and-swap guarded on the pre-assignment states so a
+// cancel racing an admin assignment can't strand the request in a bad state.
+router.post('/requests/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid request id' });
+    }
+    const reason =
+      typeof (req.body && req.body.reason) === 'string'
+        ? req.body.reason.trim()
+        : '';
+
+    const cancelled = await CareRequest.findOneAndUpdate(
+      { _id: id, status: { $in: ['submitted', 'approved'] } },
+      {
+        $set: {
+          status: 'cancelled',
+          admin_note: reason
+            ? `Cancelled by patient: ${reason}`
+            : 'Cancelled by patient',
+        },
+      },
+      { new: true },
+    );
+
+    if (!cancelled) {
+      // Distinguish "gone" from "too late to cancel" so the UI can explain.
+      const exists = await CareRequest.exists({ _id: id });
+      return res.status(exists ? 409 : 404).json({
+        message: exists
+          ? 'This request can no longer be cancelled — a coordinator has already started working on it.'
+          : 'Request not found',
+      });
+    }
+
+    res.json(cancelled.toJSON());
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
