@@ -959,12 +959,23 @@ router.patch('/visits/:id/status', async (req, res) => {
 // POST /doctor/assignments/:id/accept  → enroute
 router.post('/assignments/:id/accept', async (req, res) => {
   try {
-    const doc = await CareRequest.findByIdAndUpdate(
-      req.params.id,
+    // Atomic compare-and-swap: only the FIRST accept that finds the
+    // request still in `assigned` wins the transition to `enroute`. A
+    // racing second tap matches zero documents and is rejected — strict
+    // mutual exclusion with no read-then-write window.
+    const doc = await CareRequest.findOneAndUpdate(
+      { _id: req.params.id, status: 'assigned' },
       { status: 'enroute' },
       { new: true }
     );
-    if (!doc) return res.status(404).json({ message: 'Request not found' });
+    if (!doc) {
+      const stillExists = await CareRequest.exists({ _id: req.params.id });
+      return res.status(stillExists ? 409 : 404).json({
+        message: stillExists
+          ? 'This dispatch is no longer available — it was already accepted or reassigned.'
+          : 'Request not found',
+      });
+    }
     res.json(doc.toJSON());
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -974,8 +985,11 @@ router.post('/assignments/:id/accept', async (req, res) => {
 // POST /doctor/assignments/:id/decline  → back to approved (unassign)
 router.post('/assignments/:id/decline', async (req, res) => {
   try {
-    const doc = await CareRequest.findByIdAndUpdate(
-      req.params.id,
+    // Guarded so a decline only applies while the visit is still in an
+    // active, pre-completion state — you can't unassign a visit that has
+    // already finished or been cancelled out from under you.
+    const doc = await CareRequest.findOneAndUpdate(
+      { _id: req.params.id, status: { $in: ['assigned', 'enroute', 'arrived'] } },
       {
         status: 'approved',
         assigned_doctor_id: null,
@@ -983,7 +997,14 @@ router.post('/assignments/:id/decline', async (req, res) => {
       },
       { new: true }
     );
-    if (!doc) return res.status(404).json({ message: 'Request not found' });
+    if (!doc) {
+      const stillExists = await CareRequest.exists({ _id: req.params.id });
+      return res.status(stillExists ? 409 : 404).json({
+        message: stillExists
+          ? 'This dispatch can no longer be declined — its state has already changed.'
+          : 'Request not found',
+      });
+    }
     res.json(doc.toJSON());
   } catch (err) {
     res.status(500).json({ message: err.message });

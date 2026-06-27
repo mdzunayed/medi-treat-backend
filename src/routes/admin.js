@@ -21,6 +21,25 @@ const adminController = require('../controllers/admin.controller');
 
 const BCRYPT_ROUNDS = 10;
 
+// Terminal states a request can never be (re)assigned out of. Used as the
+// guard in the atomic compare-and-swap assignment writes below so a
+// completed/cancelled/rejected visit can't be silently re-dispatched by a
+// late or concurrent admin action.
+const TERMINAL = ['completed', 'cancelled', 'rejected'];
+
+// Folds the four fee sub-fields into `payment.total`, mirroring the
+// CareRequest `pre('save')` hook. We need it inline because the atomic
+// `findOneAndUpdate` assignment path below bypasses Mongoose middleware.
+function withPaymentTotal(payment) {
+  const merged = { ...payment };
+  merged.total =
+    (Number(merged.doctor_fee) || 0) +
+    (Number(merged.nurse_fee) || 0) +
+    (Number(merged.helper_fee) || 0) +
+    (Number(merged.platform_fee) || 0);
+  return merged;
+}
+
 // Cryptographically-secure ten-character alphanumeric password used as
 // the one-shot temporary credential for admin-provisioned doctors and
 // nurses. Excludes ambiguous glyphs (0/O, 1/I/l) so the admin can read
@@ -363,6 +382,16 @@ router.post('/requests/:id/assign', async (req, res) => {
         .json({ message: 'doctor_id or nurse_id is required' });
     }
 
+    // Manual-pricing gateway. Pricing authority now lives entirely with the
+    // admin (the patient no longer offers a budget), so a positive final
+    // service fee is mandatory at assignment time — reject null/empty/zero.
+    const amount = Number(b.final_price);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        message: 'A final service fee greater than 0 is required to assign.',
+      });
+    }
+
     // Load the existing row so we can build a clean `payment` patch on
     // top of the current fees (the pre-save hook recomputes total).
     const existing = await CareRequest.findById(req.params.id);
@@ -390,16 +419,32 @@ router.post('/requests/:id/assign', async (req, res) => {
       update.assigned_helper_id = b.helper_id || null;
       update.assigned_helper_name = b.helper_name || null;
     }
-    if (b.final_price !== undefined && b.final_price !== null) {
-      update.final_price = Number(b.final_price);
-    }
+    update.final_price = amount;
     const paymentPatch = pickPaymentPatch(b, existing.payment);
-    if (Object.keys(paymentPatch).length) update.payment = paymentPatch;
+    if (Object.keys(paymentPatch).length) {
+      const cur = existing.payment
+        ? (existing.payment.toObject ? existing.payment.toObject() : existing.payment)
+        : {};
+      update.payment = withPaymentTotal({ ...cur, ...paymentPatch });
+    }
 
-    // Apply + save through the document (rather than findByIdAndUpdate)
-    // so the pre('save') total-recompute hook fires.
-    Object.assign(existing, update);
-    await existing.save();
+    // Atomic compare-and-swap: write the assignment in a single round-trip
+    // guarded on the request still being in a non-terminal state. This
+    // closes the read-then-write window where two concurrent admin assigns
+    // (or a double-tap) could clobber each other or re-dispatch a finished
+    // visit. `findOneAndUpdate` bypasses the pre('save') hook, so
+    // `payment.total` is folded in above.
+    const result = await CareRequest.findOneAndUpdate(
+      { _id: req.params.id, status: { $nin: TERMINAL } },
+      { $set: update },
+      { new: true },
+    );
+    if (!result) {
+      return res.status(409).json({
+        message:
+          'This request can no longer be assigned — it was already completed, cancelled, or rejected.',
+      });
+    }
 
     const [doctorPair, nursePair] = await Promise.all([
       b.doctor_id ? loadProviderPair(b.doctor_id, 'doctor') : Promise.resolve({ provider: null, account: null }),
@@ -407,14 +452,14 @@ router.post('/requests/:id/assign', async (req, res) => {
     ]);
     await notifyAssignment(
       req.app.get('io'),
-      existing,
+      result,
       { doctor: doctorPair, nurse: nursePair },
       {
         notifyDoctor: !!b.doctor_id && b.doctor_id.toString() !== prevDoctorId,
         notifyNurse: !!b.nurse_id && b.nurse_id.toString() !== prevNurseId,
       },
     );
-    res.json(existing.toJSON());
+    res.json(result.toJSON());
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -445,6 +490,14 @@ router.post('/appointments/assign', async (req, res) => {
     }
     if (!mongoose.isValidObjectId(appointmentId)) {
       return res.status(400).json({ message: 'Invalid appointmentId' });
+    }
+    // Manual-pricing gateway — same contract as POST /requests/:id/assign:
+    // a positive final service fee is mandatory at assignment time.
+    const amount = Number(b.finalPrice ?? b.final_price);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        message: 'A final service fee greater than 0 is required to assign.',
+      });
     }
 
     // Resolve each provider up-front so we can store the human-readable
@@ -501,27 +554,41 @@ router.post('/appointments/assign', async (req, res) => {
     if (b.helperName || b.helper_name) {
       update.assigned_helper_name = b.helperName || b.helper_name;
     }
-    const finalPrice = b.finalPrice ?? b.final_price;
-    if (finalPrice !== undefined && finalPrice !== null) {
-      const n = Number(finalPrice);
-      if (Number.isFinite(n)) update.final_price = n;
-    }
+    update.final_price = amount;
     const paymentPatch = pickPaymentPatch(b, existing.payment);
-    if (Object.keys(paymentPatch).length) update.payment = paymentPatch;
+    if (Object.keys(paymentPatch).length) {
+      const cur = existing.payment
+        ? (existing.payment.toObject ? existing.payment.toObject() : existing.payment)
+        : {};
+      update.payment = withPaymentTotal({ ...cur, ...paymentPatch });
+    }
 
-    Object.assign(existing, update);
-    await existing.save();
+    // Atomic compare-and-swap (see /requests/:id/assign for rationale):
+    // single guarded round-trip so concurrent assigns can't clobber each
+    // other and a terminal visit can't be re-dispatched.
+    const result = await CareRequest.findOneAndUpdate(
+      { _id: appointmentId, status: { $nin: TERMINAL } },
+      { $set: update },
+      { new: true },
+    );
+    if (!result) {
+      return res.status(409).json({
+        success: false,
+        message:
+          'This appointment can no longer be assigned — it was already completed, cancelled, or rejected.',
+      });
+    }
 
     await notifyAssignment(
       req.app.get('io'),
-      existing,
+      result,
       { doctor: doctorPair, nurse: nursePair },
       {
         notifyDoctor: !!doctorId && doctorId.toString() !== prevDoctorId,
         notifyNurse: !!nurseId && nurseId.toString() !== prevNurseId,
       },
     );
-    const body = await attachDoctorToRequest(existing.toJSON());
+    const body = await attachDoctorToRequest(result.toJSON());
     res.json({ success: true, appointment: body });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

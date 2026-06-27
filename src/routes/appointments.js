@@ -564,8 +564,22 @@ router.patch('/:id/accept', requireAccountId, async (req, res) => {
     if (!guard.ok) {
       return res.status(guard.code).json({ success: false, message: guard.message });
     }
-    appt.status = 'enroute';
-    await appt.save();
+    // Atomic transition guarded on the request still being `assigned`. The
+    // identity check above proves the caller owns the dispatch; this CAS
+    // proves no one (a provider double-tap, or a concurrent admin re-route)
+    // has already moved it on. Only the first writer wins.
+    const updated = await CareRequest.findOneAndUpdate(
+      { _id: id, status: 'assigned' },
+      { status: 'enroute' },
+      { new: true },
+    );
+    if (!updated) {
+      return res.status(409).json({
+        success: false,
+        message:
+          'This dispatch was already accepted or is no longer awaiting acceptance.',
+      });
+    }
 
     const io = req.app.get('io');
     if (io) {
@@ -578,7 +592,7 @@ router.patch('/:id/accept', requireAccountId, async (req, res) => {
         timestamp: new Date().toISOString(),
       });
     }
-    const out = await attachDoctorToRequest(appt.toJSON());
+    const out = await attachDoctorToRequest(updated.toJSON());
     return res.json({ success: true, appointment: out });
   } catch (err) {
     console.error('[appointments/accept] error:', err);
@@ -612,15 +626,26 @@ router.patch('/:id/reject', requireAccountId, async (req, res) => {
     if (!guard.ok) {
       return res.status(guard.code).json({ success: false, message: guard.message });
     }
-    if (guard.identity.role === 'nurse') {
-      appt.assigned_nurse_id = null;
-      appt.assigned_nurse_name = null;
-    } else {
-      appt.assigned_doctor_id = null;
-      appt.assigned_doctor_name = null;
+    // Clear only the caller's side of the assignment, atomically, and only
+    // while the visit is still in a pre-completion state — so a reject
+    // racing a completion (or a double-tap) can't resurrect a finished
+    // visit back to `approved`.
+    const clear =
+      guard.identity.role === 'nurse'
+        ? { assigned_nurse_id: null, assigned_nurse_name: null }
+        : { assigned_doctor_id: null, assigned_doctor_name: null };
+    const updated = await CareRequest.findOneAndUpdate(
+      { _id: id, status: { $in: ['assigned', 'enroute', 'arrived'] } },
+      { $set: { status: 'approved', ...clear } },
+      { new: true },
+    );
+    if (!updated) {
+      return res.status(409).json({
+        success: false,
+        message:
+          'This dispatch can no longer be declined — its state has already changed.',
+      });
     }
-    appt.status = 'approved';
-    await appt.save();
 
     const io = req.app.get('io');
     if (io) {
@@ -633,7 +658,7 @@ router.patch('/:id/reject', requireAccountId, async (req, res) => {
         timestamp: new Date().toISOString(),
       });
     }
-    const out = await attachDoctorToRequest(appt.toJSON());
+    const out = await attachDoctorToRequest(updated.toJSON());
     return res.json({ success: true, appointment: out });
   } catch (err) {
     console.error('[appointments/reject] error:', err);
